@@ -462,12 +462,109 @@ class WanVideoImageToVideoMultiTalk:
 
         return (image_embeds, output_path)
     
+# 保留原节点以保持向后兼容
+class BBoxToMultiTalkMask:
+    """
+    从多个bbox生成MultiTalk所需的mask格式（保留以向后兼容）
+    建议使用 MultiTalkMaskFromBBoxOrMask 节点
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "bbox_1": ("STRING", {"default": "0,0,416,480", "tooltip": "第一个bbox，格式: x1,y1,x2,y2 (左上角和右下角坐标)"}),
+                "include_background": ("BOOLEAN", {"default": True, "tooltip": "是否包含背景mask（推荐启用）"}),
+            },
+            "optional": {
+                "image": ("IMAGE", {"tooltip": "输入图像，用于自动获取尺寸（如果提供，将忽略width和height参数）"}),
+                "width": ("INT", {"default": 832, "min": 64, "max": 4096, "step": 1, "tooltip": "图像宽度（仅在未提供image时使用）"}),
+                "height": ("INT", {"default": 480, "min": 64, "max": 4096, "step": 1, "tooltip": "图像高度（仅在未提供image时使用）"}),
+                "bbox_2": ("STRING", {"default": "", "tooltip": "第二个bbox，格式: x1,y1,x2,y2"}),
+                "bbox_3": ("STRING", {"default": "", "tooltip": "第三个bbox，格式: x1,y1,x2,y2"}),
+                "bbox_4": ("STRING", {"default": "", "tooltip": "第四个bbox，格式: x1,y1,x2,y2"}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("ref_target_masks",)
+    FUNCTION = "create_masks"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "从多个bbox创建MultiTalk所需的mask格式，用于指定每个说话者的位置。支持最多4个bbox。"
+
+    def create_masks(self, bbox_1, include_background, image=None, width=832, height=480, bbox_2="", bbox_3="", bbox_4=""):
+        import torch
+        
+        # 如果提供了图像，从图像获取尺寸
+        if image is not None:
+            # image shape: [batch, height, width, channels]
+            height = image.shape[1]
+            width = image.shape[2]
+            log.info(f"从图像获取尺寸: {width}x{height}")
+        
+        def parse_bbox(bbox_str):
+            """解析bbox字符串为坐标"""
+            if not bbox_str or bbox_str.strip() == "":
+                return None
+            try:
+                coords = [int(x.strip()) for x in bbox_str.split(",")]
+                if len(coords) != 4:
+                    raise ValueError("bbox必须包含4个坐标值: x1,y1,x2,y2")
+                x1, y1, x2, y2 = coords
+                # 确保坐标在有效范围内并正确排序
+                x1 = max(0, min(x1, width))
+                y1 = max(0, min(y1, height))
+                x2 = max(x1, min(x2, width))
+                y2 = max(y1, min(y2, height))
+                if x2 <= x1 or y2 <= y1:
+                    log.warning(f"bbox无效: ({x1},{y1},{x2},{y2}), 宽度或高度为0")
+                    return None
+                return (x1, y1, x2, y2)
+            except Exception as e:
+                log.warning(f"解析bbox失败: {bbox_str}, 错误: {e}")
+                return None
+        
+        # 解析所有bbox
+        bboxes = []
+        for i, bbox_str in enumerate([bbox_1, bbox_2, bbox_3, bbox_4], 1):
+            bbox = parse_bbox(bbox_str)
+            if bbox is not None:
+                bboxes.append(bbox)
+                log.info(f"解析bbox {i}: ({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]})")
+        
+        if len(bboxes) == 0:
+            raise ValueError("至少需要提供一个有效的bbox。格式: x1,y1,x2,y2")
+        
+        # 为每个bbox创建mask
+        masks = []
+        for i, (x1, y1, x2, y2) in enumerate(bboxes):
+            mask = torch.zeros((height, width), dtype=torch.float32)
+            mask[y1:y2, x1:x2] = 1.0
+            masks.append(mask)
+            log.info(f"创建mask {i+1}: bbox=({x1},{y1},{x2},{y2}), 区域大小={x2-x1}x{y2-y1}")
+        
+        # 可选：添加背景mask
+        if include_background:
+            # 背景mask是所有bbox区域的补集
+            combined_mask = torch.zeros((height, width), dtype=torch.float32)
+            for mask in masks:
+                combined_mask = torch.maximum(combined_mask, mask)
+            background_mask = 1.0 - combined_mask
+            masks.append(background_mask)
+            log.info(f"创建背景mask")
+        
+        # 堆叠所有mask: [num_masks, H, W]
+        ref_target_masks = torch.stack(masks, dim=0)
+        log.info(f"最终mask形状: {ref_target_masks.shape} (num_masks={len(masks)}, height={height}, width={width})")
+        
+        return (ref_target_masks,)
+
 NODE_CLASS_MAPPINGS = {
     "MultiTalkModelLoader": MultiTalkModelLoader,
     "MultiTalkWav2VecEmbeds": MultiTalkWav2VecEmbeds,
     "WanVideoImageToVideoMultiTalk": WanVideoImageToVideoMultiTalk,
     "Wav2VecModelLoader": Wav2VecModelLoader,
     "MultiTalkSilentEmbeds": MultiTalkSilentEmbeds,
+    "BBoxToMultiTalkMask": BBoxToMultiTalkMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -476,4 +573,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoImageToVideoMultiTalk": "WanVideo Long I2V Multi/InfiniteTalk",
     "Wav2VecModelLoader": "Wav2vec2 Model Loader",
     "MultiTalkSilentEmbeds": "MultiTalk Silent Embeds",
+    "BBoxToMultiTalkMask": "BBox to MultiTalk Mask",
 }
