@@ -4,16 +4,120 @@ import logging
 import math
 from tqdm import tqdm
 from pathlib import Path
-import os
+import gc
 import types, collections
 from comfy.utils import ProgressBar, copy_to_param, set_attr_param
-from comfy.model_patcher import get_key_weight, string_to_seed
+from comfy.model_patcher import get_key_weight
 from comfy.lora import calculate_weight
-from comfy.model_management import cast_to_device
+
+try:
+    from comfy.utils import string_to_seed
+except Exception:
+    from comfy.model_patcher import string_to_seed
+
 from comfy.float import stochastic_rounding
+from .custom_linear import remove_lora_from_module
 import folder_paths
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
+
+import comfy.model_management as mm
+device = mm.get_torch_device()
+offload_device = mm.unet_offload_device()
+
+try:
+    from .gguf.gguf import GGUFParameter
+except Exception:
+    pass
+
+COLOR_CODES = {
+    "reset": "\033[0m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+}
+
+def color_text(text, color):
+    try:
+        return f"{COLOR_CODES.get(color, COLOR_CODES['reset'])}{text}{COLOR_CODES['reset']}"
+    except Exception:
+        return text
+
+class MetaParameter(torch.nn.Parameter):
+    def __new__(cls, dtype, quant_type=None):
+        data = torch.empty(0, dtype=dtype)
+        self = torch.nn.Parameter(data, requires_grad=False)
+        self.quant_type = quant_type
+        return self
+
+def offload_transformer(transformer, remove_lora=True):
+    transformer.teacache_state.clear_all()
+    transformer.magcache_state.clear_all()
+    transformer.easycache_state.clear_all()
+
+    if transformer.patched_linear:
+        for name, param in transformer.named_parameters():
+            if "loras" in name or "controlnet" in name:
+                continue
+            module = transformer
+            subnames = name.split('.')
+            for subname in subnames[:-1]:
+                module = getattr(module, subname)
+            attr_name = subnames[-1]
+            if param.data.is_floating_point():
+                meta_param = torch.nn.Parameter(torch.empty_like(param.data, device='meta'), requires_grad=False)
+                setattr(module, attr_name, meta_param)
+            elif isinstance(param.data, GGUFParameter):
+                quant_type = getattr(param, 'quant_type', None)
+                setattr(module, attr_name, MetaParameter(param.data.dtype, quant_type))
+            else:
+                pass
+        if remove_lora:
+            remove_lora_from_module(transformer)
+    else:
+        transformer.to(offload_device)
+
+    for block in transformer.blocks:
+        block.kv_cache = None
+        if transformer.audio_model is not None and hasattr(block, 'audio_block'):
+            block.audio_block = None
+
+    mm.soft_empty_cache()
+    gc.collect()
+
+
+def init_blockswap(transformer, block_swap_args, model):
+    if not transformer.patched_linear:
+        if block_swap_args is not None:
+            for name, param in transformer.named_parameters():
+                if "block" not in name or "control_adapter" in name or "face" in name:
+                    param.data = param.data.to(device)
+                elif block_swap_args["offload_txt_emb"] and "txt_emb" in name:
+                    param.data = param.data.to(offload_device)
+                elif block_swap_args["offload_img_emb"] and "img_emb" in name:
+                    param.data = param.data.to(offload_device)
+
+            transformer.block_swap(
+                block_swap_args["blocks_to_swap"] - 1 ,
+                block_swap_args["offload_txt_emb"],
+                block_swap_args["offload_img_emb"],
+                vace_blocks_to_swap = block_swap_args.get("vace_blocks_to_swap", None),
+            )
+        elif model["auto_cpu_offload"]:
+            for module in transformer.modules():
+                if hasattr(module, "offload"):
+                    module.offload()
+                if hasattr(module, "onload"):
+                    module.onload()
+            for block in transformer.blocks:
+                block.modulation = torch.nn.Parameter(block.modulation.to(device))
+            transformer.head.modulation = torch.nn.Parameter(transformer.head.modulation.to(device))
+        else:
+            transformer.to(device)
 
 def check_device_same(first_device, second_device):
     if first_device.type != second_device.type:
@@ -91,9 +195,9 @@ def set_module_tensor_to_device(module, tensor_name, device, value=None, dtype=N
             device = device_quantization
         if is_buffer:
             module._buffers[tensor_name] = new_value
-        elif value is not None or not check_device_same(torch.device(device), module._parameters[tensor_name].device):
+        elif value is not None or not check_device_same(device, module._parameters[tensor_name].device):
             param_cls = type(module._parameters[tensor_name])
-            new_value = param_cls(new_value, requires_grad=False).to(device)
+            new_value = param_cls(new_value, requires_grad=False)
             module._parameters[tensor_name] = new_value
 
     #if device != "cpu":
@@ -109,10 +213,8 @@ def check_diffusers_version():
         raise AssertionError("diffusers is not installed.")
 
 def print_memory(device, process="Sampling"):
-    memory = torch.cuda.memory_allocated(device) / 1024**3
     max_memory = torch.cuda.max_memory_allocated(device) / 1024**3
     max_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
-    log.info(f"[{process}] Allocated memory: {memory=:.3f} GB")
     log.info(f"[{process}] Max allocated memory: {max_memory=:.3f} GB")
     log.info(f"[{process}] Max reserved memory: {max_reserved=:.3f} GB")
     #memory_summary = torch.cuda.memory_summary(device=device, abbreviated=False)
@@ -124,6 +226,18 @@ def get_module_memory_mb(module):
         if param.data is not None:
             memory += param.nelement() * param.element_size()
     return memory / (1024 * 1024)  # Convert to MB
+
+def get_module_memory_mb_per_device(module):
+    memory_per_device = {}
+    memory = 0
+    for param in module.parameters():
+        if param.data is not None:
+            device = str(param.device)
+            memory += param.nelement() * param.element_size()
+            memory_per_device[device] = memory_per_device.get(device, 0) + memory
+
+    memory_per_device = {dev: mem / (1024 * 1024) for dev, mem in memory_per_device.items()}
+    return memory_per_device
 
 def get_tensor_memory(tensor):
     memory_bytes = tensor.element_size() * tensor.nelement()
@@ -140,7 +254,7 @@ def patch_weight_to_device(self, key, device_to=None, inplace_update=False, back
         self.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(weight.to(device=self.offload_device, copy=inplace_update), inplace_update)
 
     if device_to is not None:
-        temp_weight = cast_to_device(weight, device_to, torch.float32, copy=True)
+        temp_weight = mm.cast_to_device(weight, device_to, torch.float32, copy=True)
     else:
         temp_weight = weight.to(torch.float32, copy=True)
     if convert_func is not None:
@@ -195,7 +309,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                     key = f"{name.replace('diffusion_model.', '')}.{param}"
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[key])
-                    except:
+                    except Exception:
                         continue
                 key = f"{name}.{param}"
                 if scale_weights is not None:
@@ -209,7 +323,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                 if low_mem_load:
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, key, device=transformer_load_device, dtype=dtype_to_use, value=model.model.diffusion_model.state_dict()[key])
-                    except:
+                    except Exception:
                         continue
             m.comfy_patched_weights = True
             cnt += 1
@@ -238,7 +352,7 @@ def apply_lora(model, device_to, transformer_load_device, params_to_keep=None, d
                         dtype_to_use = torch.float32
                     try:
                         set_module_tensor_to_device(model.model.diffusion_model, name, device=transformer_load_device, dtype=dtype_to_use, value=state_dict[name])
-                    except:
+                    except Exception:
                         continue
         return model
 
@@ -584,17 +698,18 @@ def check_duplicate_nodes():
     """Check ComfyUI custom_nodes directory for duplicate installations"""
     custom_nodes_dir = Path(folder_paths.folder_names_and_paths["custom_nodes"][0][0])
     current_path = Path(__file__).parent
-    
+
     wanvideo_dirs = []
-    
+
     # Check all directories in custom_nodes
     for path in custom_nodes_dir.iterdir():
-        if (path.is_dir() and 
+        if (path.is_dir() and
             path != current_path and
+            not path.name.endswith('.disabled') and
             'wanvideo' in path.name.lower() and
             'wrapper' in path.name.lower()):
             wanvideo_dirs.append(str(path))
-    
+
     return wanvideo_dirs
 
 #https://github.com/temporalscorerescaling/TSR/
@@ -609,3 +724,55 @@ def temporal_score_rescaling(model_output, sample, timestep, k=1.0, tsr_sigma=0.
     if not t == 1.0:
         model_output = (ratio * ((1-t) * model_output + sample) - sample) / (1 - t)
     return model_output
+
+def match_and_blend_colors(
+    source_chunk: torch.Tensor,  # (C, T, H, W), range [-1, 1]
+    reference_image: torch.Tensor,  # (C, 1, H, W), range [-1, 1]
+    strength: float,
+) -> torch.Tensor:
+    import kornia
+    if strength == 0.0:
+        return source_chunk
+    source_chunk = source_chunk.unsqueeze(0)  # (1, C, T, H, W)
+
+    # shapes
+    B, C, T, H, W = source_chunk.shape
+    input_dtype = source_chunk.dtype
+
+    # [-1,1] -> [0,1]
+    src_01 = (source_chunk + 1.0) * 0.5
+    ref_01 = (reference_image + 1.0) * 0.5
+
+    src32 = src_01.to(torch.float32)
+    ref32 = ref_01.to(torch.float32)
+
+    # (B, C, T, H, W) -> (B*T, C, H, W)
+    src_bt = src32.permute(0, 2, 1, 3, 4).contiguous().view(B * T, C, H, W)
+    ref_bchw = ref32[:, :, 0, :, :].contiguous()
+
+    # RGB->Lab
+    src_lab = kornia.color.rgb_to_lab(src_bt)  # (B*T, C, H, W)
+    ref_lab = kornia.color.rgb_to_lab(ref_bchw)  # (B,   C, H, W)
+
+    src_lab_flat = src_lab.view(B * T, C, -1)  # (B*T, C, HW)
+    ref_lab_flat = ref_lab.view(B, C, -1)  # (B,   C, HW)
+    src_std, src_mean = torch.std_mean(src_lab_flat, dim=-1, keepdim=True, unbiased=False)
+    ref_std, ref_mean = torch.std_mean(ref_lab_flat, dim=-1, keepdim=True, unbiased=False)
+    src_std = src_std.clamp_min_(1e-6)
+
+    ref_mean_bt = ref_mean.repeat_interleave(T, dim=0)  # (B*T, C, 1)
+    ref_std_bt = ref_std.repeat_interleave(T, dim=0)  # (B*T, C, 1)
+
+    corrected_lab_flat = (src_lab_flat - src_mean) * (ref_std_bt / src_std) + ref_mean_bt
+    corrected_lab = corrected_lab_flat.view(B * T, C, H, W)
+
+    # Lab->RGB
+    corrected_rgb_01 = kornia.color.lab_to_rgb(corrected_lab)  # (B*T, C, H, W)
+
+    blended_rgb_01 = (1.0 - strength) * src_bt + strength * corrected_rgb_01
+
+    # (B, C, T, H, W)
+    blended_rgb_01 = blended_rgb_01.view(B, T, C, H, W).permute(0, 2, 1, 3, 4).contiguous()
+
+    # [0,1] -> [-1,1]
+    return (blended_rgb_01 * 2.0 - 1.0)[0].to(dtype=input_dtype)

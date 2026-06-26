@@ -13,7 +13,7 @@ from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
 from .custom_linear import _replace_linear
 
 from accelerate import init_empty_weights
-from .utils import set_module_tensor_to_device
+from .utils import set_module_tensor_to_device, get_module_memory_mb_per_device
 
 import folder_paths
 import comfy.model_management as mm
@@ -23,7 +23,7 @@ from comfy.sd import load_lora_for_models
 try:
     from .gguf.gguf import _replace_with_gguf_linear, GGUFParameter
     from gguf import GGMLQuantizationType
-except:
+except Exception:
     pass
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -33,8 +33,11 @@ offload_device = mm.unet_offload_device()
 
 try:
     from server import PromptServer
-except:
+except Exception:
     PromptServer = None
+
+attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
+                    "sageattn_ultravico", "comfy"]
 
 #from city96's gguf nodes
 def update_folder_names_and_paths(key, targets=[]):
@@ -49,17 +52,6 @@ def update_folder_names_and_paths(key, targets=[]):
         log.warning(f"Unknown file list already present on key {key}: {base}")
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 
-class WanVideoModel(comfy.model_base.BaseModel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.pipeline = {}
-
-    def __getitem__(self, k):
-        return self.pipeline[k]
-
-    def __setitem__(self, k, v):
-        self.pipeline[k] = v
-
 try:
     from comfy.latent_formats import Wan21, Wan22
     latent_format = Wan21
@@ -68,16 +60,27 @@ except: #for backwards compatibility
     from comfy.latent_formats import HunyuanVideo
     latent_format = HunyuanVideo
 
+class WanVideoModel(torch.nn.Module):
+    def __init__(self, model_config, transformer, device=None):
+        super().__init__()
+        self.latent_format = model_config.latent_format
+        self.model_config = model_config
+        self.device = device
+        self.current_patcher = None
+        self.diffusion_model = transformer
+        self.pipeline = {}
+
+    def __getitem__(self, k):
+        return self.pipeline[k]
+
+    def __setitem__(self, k, v):
+        self.pipeline[k] = v
+
 class WanVideoModelConfig:
-    def __init__(self, dtype, latent_format=latent_format):
+    def __init__(self, latent_format=latent_format):
         self.unet_config = {}
         self.unet_extra_config = {}
         self.latent_format = latent_format
-        #self.latent_format.latent_channels = 16
-        self.manual_cast_dtype = dtype
-        self.sampling_settings = {"multiplier": 1.0}
-        self.memory_usage_factor = 2.0
-        self.unet_config["disable_unet_model_creation"] = True
 
 def filter_state_dict_by_blocks(state_dict, blocks_mapping, layer_filter=[]):
     filtered_dict = {}
@@ -178,7 +181,7 @@ def standardize_lora_key_format(lora_sd):
 
                         new_key += f".{component}"
 
-                # Handle weight type - this is the critical fix
+                # Handle weight type
                 if weight_type:
                     if weight_type == 'alpha':
                         new_key += '.alpha'
@@ -209,12 +212,12 @@ def standardize_lora_key_format(lora_sd):
                 new_key = new_key.replace('time_embedding', 'time.embedding')
                 new_key = new_key.replace('time_projection', 'time.projection')
 
-                # Replace remaining underscores with dots, carefully
+                # Replace remaining underscores with dots
                 parts = new_key.split('.')
                 final_parts = []
                 for part in parts:
                     if part in ['img_emb', 'self_attn', 'cross_attn']:
-                        final_parts.append(part)  # Keep these intact
+                        final_parts.append(part)
                     else:
                         final_parts.append(part.replace('_', '.'))
                 new_key = '.'.join(final_parts)
@@ -272,6 +275,20 @@ def standardize_lora_key_format(lora_sd):
         if "txt_attn.qkv" in k:
             k = k.replace("txt_attn.qkv", "txt_attn_qkv")
         new_sd[k] = v
+    return new_sd
+
+def compensate_rs_lora_format(lora_sd):
+    rank = lora_sd["base_model.model.blocks.0.cross_attn.k.lora_A.weight"].shape[0]
+    alpha = torch.tensor(rank * rank // rank ** 0.5)
+    log.info(f"Detected rank stabilized peft lora format with rank {rank}, setting alpha to {alpha} to compensate.")
+    new_sd = {}
+    for k, v in lora_sd.items():
+        if k.endswith(".lora_A.weight"):
+            new_sd[k] = v
+            new_k = k.replace(".lora_A.weight", ".alpha")
+            new_sd[new_k] = alpha
+        else:
+            new_sd[k] = v
     return new_sd
 
 class WanVideoBlockSwap:
@@ -364,7 +381,7 @@ class WanVideoLoraSelect:
             "required": {
                "lora": (folder_paths.get_filename_list("loras"),
                 {"tooltip": "LORA models are expected to be in ComfyUI/models/loras with .safetensors extension"}),
-                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -1000.0, "max": 1000.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
             },
             "optional": {
                 "prev_lora":("WANVIDLORA", {"default": None, "tooltip": "For loading multiple LoRAs"}),
@@ -397,7 +414,7 @@ class WanVideoLoraSelect:
 
         try:
             lora_path = folder_paths.get_full_path_or_raise("loras", lora)
-        except:
+        except Exception:
             lora_path = lora
 
         # Load metadata from the safetensors file
@@ -756,6 +773,8 @@ class WanVideoSetLoRAs:
             lora_sd = load_torch_file(lora_path, safe_load=True)
             if "dwpose_embedding.0.weight" in lora_sd: #unianimate
                 raise NotImplementedError("Unianimate LoRA patching is not implemented in this node.")
+            if "base_model.model.blocks.0.cross_attn.k.lora_A.weight" in lora_sd: # assume rs_lora
+                lora_sd = compensate_rs_lora_format(lora_sd)
 
             lora_sd = standardize_lora_key_format(lora_sd)
             if l["blocks"]:
@@ -791,7 +810,6 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                       "adapter", "add", "ref_conv", "casual_audio_encoder", "cond_encoder", "frame_packer", "audio_proj_glob", "face_encoder", "fuser_block"}
     param_count = sum(1 for _ in transformer.named_parameters())
     pbar = ProgressBar(param_count)
-    cnt = 0
     block_idx = vace_block_idx = None
 
     if gguf:
@@ -811,7 +829,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             all_tensors.extend(r.tensors)
         for tensor in all_tensors:
             name = rename_fuser_block(tensor.name)
-            if "glob" not in name and "audio_proj" in name:
+            if "glob" not in name and "multitalk_audio_proj" not in name and "audio_proj" in name:
                 name = name.replace("audio_proj", "multitalk_audio_proj")
             load_device = device
             if "vace_blocks." in name:
@@ -845,7 +863,7 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
             )
             transformer.gguf_patched = True
     else:
-        log.info("Using accelerate to load and assign model weights to device...")
+        log.info("Loading and assigning model weights to device...")
     named_params = transformer.named_parameters()
 
     for name, param in tqdm(named_params,
@@ -901,12 +919,17 @@ def load_weights(transformer, sd=None, weight_dtype=None, base_dtype=None,
                     load_device = offload_device
         # Set tensor to device
         set_module_tensor_to_device(transformer, name, device=load_device, dtype=dtype_to_use, value=value)
-        cnt += 1
-        if cnt % 100 == 0:
-            pbar.update(100)
+        pbar.update(1)
 
     #[print(name, param.device, param.dtype) for name, param in transformer.named_parameters()]
+    memory_on_device = get_module_memory_mb_per_device(transformer)
+    log.info("-" * 25)
+    log.info("Transformer weights loaded:")
+    for dev, mem_mb in memory_on_device.items():
+        log.info(f"Device: {dev:8s} | Memory: {mem_mb:,.2f} MB")
 
+    if hasattr(pbar, "_last_sent_value"):
+        pbar._last_sent_value = -1
     pbar.update_absolute(0)
 
 def patch_control_lora(transformer, device):
@@ -967,7 +990,8 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
             from .unianimate.nodes import update_transformer
             log.info("Unianimate LoRA detected, patching model...")
             patcher.model.diffusion_model, unianimate_sd = update_transformer(patcher.model.diffusion_model, lora_sd)
-
+        if "base_model.model.blocks.0.cross_attn.k.lora_A.weight" in lora_sd: # assume rs_lora
+                lora_sd = compensate_rs_lora_format(lora_sd)
         lora_sd = standardize_lora_key_format(lora_sd)
 
         if l["blocks"]:
@@ -989,6 +1013,66 @@ def add_lora_weights(patcher, lora, base_dtype, merge_loras=False):
         del lora_sd
     return patcher, control_lora, unianimate_sd
 
+class WanVideoSetAttentionModeOverride:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "attention_mode": (attention_modes, {"default": "sdpa"}),
+                "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Step to start applying the attention mode override"}),
+                "end_step": ("INT", {"default": 10000, "min": 1, "max": 10000, "step": 1, "tooltip": "Step to end applying the attention mode override"}),
+                "verbose": ("BOOLEAN", {"default": False, "tooltip": "Print verbose info about attention mode override during generation"}),
+            },
+            "optional": {
+                "blocks":("INT", {"forceInput": True} ),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "getmodelpath"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Override the attention mode for the model for specific step and/or block range"
+
+    def getmodelpath(self, model, attention_mode, start_step, end_step, verbose, blocks=None):
+        model_clone = model.clone()
+        attention_mode_override = {
+            "mode": attention_mode,
+            "start_step": start_step,
+            "end_step": end_step,
+            "verbose": verbose,
+        }
+        if blocks is not None:
+            attention_mode_override["blocks"] = blocks
+        model_clone.model_options['transformer_options']["attention_mode_override"] = attention_mode_override
+
+        return (model_clone,)
+
+
+class WanVideoUltraVicoSettings:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("WANVIDEOMODEL", ),
+                "alpha": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Alpha value for the decay, higher values mean slower decay"}),
+            },
+        }
+
+    RETURN_TYPES = ("WANVIDEOMODEL",)
+    RETURN_NAMES = ("model", )
+    FUNCTION = "getmodelpath"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Set UltraVico parameters, attention mode still needs to be set to sageattn_ultravico, https://github.com/thu-ml/DiT-Extrapolation"
+
+    def getmodelpath(self, model, alpha):
+        model_clone = model.clone()
+        model_clone.model_options['transformer_options']["ultravico_alpha"] = alpha
+
+        return (model_clone,)
+
+
 #region Model loading
 class WanVideoModelLoader:
     @classmethod
@@ -1003,17 +1087,7 @@ class WanVideoModelLoader:
             "load_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Initial device to load the model to, NOT recommended with the larger models unless you have 48GB+ VRAM"}),
             },
             "optional": {
-                "attention_mode": ([
-                    "sdpa",
-                    "flash_attn_2",
-                    "flash_attn_3",
-                    "sageattn",
-                    "sageattn_3",
-                    "radial_sage_attention",
-                    "sageattn_compiled",
-                    "sageattn_ultravico",
-                    "comfy"
-                    ], {"default": "sdpa"}),
+                "attention_mode": (attention_modes, {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "block_swap_args": ("BLOCKSWAPARGS", ),
                 "lora": ("WANVIDLORA", {"default": None}),
@@ -1077,7 +1151,7 @@ class WanVideoModelLoader:
             try:
                 if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
                     torch.backends.cuda.matmul.allow_fp16_accumulation = False
-            except:
+            except Exception:
                 pass
 
 
@@ -1218,9 +1292,7 @@ class WanVideoModelLoader:
             lynx_ip_layers = "lite"
 
         model_type = "t2v"
-        if "audio_injector.injector.0.k.weight" in sd:
-            model_type = "s2v"
-        elif not "text_embedding.0.weight" in sd:
+        if not "text_embedding.0.weight" in sd:
             model_type = "no_cross_attn" #minimaxremover
         elif "model_type.Wan2_1-FLF2V-14B-720P" in sd or "img_emb.emb_pos" in sd or "flf2v" in model.lower():
             model_type = "fl2v"
@@ -1230,6 +1302,8 @@ class WanVideoModelLoader:
             model_type = "t2v"
         elif "control_adapter.conv.weight" in sd:
             model_type = "t2v"
+        if "audio_injector.injector.0.k.weight" in sd:
+            model_type = "s2v"
 
         out_dim = 16
         if dim == 5120: #14B
@@ -1437,7 +1511,57 @@ class WanVideoModelLoader:
                     block.cross_attn.ip_adapter_single_stream_k_proj = nn.Linear(context_dim, dim, bias=False)
                     block.cross_attn.ip_adapter_single_stream_v_proj = nn.Linear(context_dim, dim, bias=False)
 
-        if multitalk_model is not None:
+        # LongCat Avatar
+        proj1_key = "multitalk_audio_proj.proj1.weight" if "multitalk_audio_proj.proj1.weight" in sd \
+                    else "multitalk_audio_proj.proj1.weight_int8" if "multitalk_audio_proj.proj1.weight_int8" in sd \
+                    else None
+        if proj1_key is not None and ("blocks.0.audio_cross_attn.q_norm.weight" in sd or "blocks.0.audio_cross_attn.q_norm.weight_int8" in sd):
+            log.info("MultiTalk/InfiniteTalk model detected, patching model...")
+            from .multitalk.multitalk import AudioProjModel
+            from .wanvideo.modules.model import WanLayerNorm
+            from .LongCat.layers import SingleStreamAttention
+
+            # Detect LongCat-Avatar audio encoder variant from proj1 input dim:
+            #   v1.0 (wav2vec2): seq_len * blocks * channels = 5 * 12 * 768 = 46080
+            #   v1.5 (whisper):  seq_len * blocks * channels = 5 *  5 * 1280 = 32000
+            proj1_in = sd[proj1_key].shape[1]
+            if proj1_in == 32000:
+                audio_proj_blocks, audio_proj_channels = 5, 1280
+                log.info("LongCat-Avatar-1.5 (Whisper) audio proj detected")
+            else:
+                audio_proj_blocks, audio_proj_channels = 12, 768
+
+            for block in transformer.blocks:
+                with init_empty_weights():
+                    if "blocks.0.audio_modulation.1.weight" in sd:
+                        block.audio_modulation = nn.Sequential(nn.SiLU(), nn.Linear(512, 3 * dim, bias=True))
+                    block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
+                    block.audio_cross_attn = SingleStreamAttention(
+                            dim=dim,
+                            encoder_hidden_states_dim=768,
+                            num_heads=num_heads,
+                        qkv_bias=True,
+                        qk_norm=True,
+                        class_range=24,
+                        class_interval=4,
+                        attention_mode=attention_mode,
+                    )
+                    multitalk_proj_model = AudioProjModel(blocks=audio_proj_blocks, channels=audio_proj_channels)
+            transformer.multitalk_audio_proj = multitalk_proj_model
+        # SkyreelsV3
+        elif "blocks.1.audio_cross_attn.kv_linear.weight" in sd and "audio_proj.proj1.weight" in sd:
+            sd = {k.replace("audio_proj", "multitalk_audio_proj"): v for k, v in sd.items()}
+            # init audio module
+            from .multitalk.multitalk import SingleStreamMultiAttention, AudioProjModel
+            from .wanvideo.modules.model import WanLayerNorm
+
+            for block in transformer.blocks:
+                with init_empty_weights():
+                    block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
+                    block.audio_cross_attn = SingleStreamMultiAttention(dim=dim, num_heads=num_heads, attention_mode=attention_mode)
+
+            transformer.multitalk_audio_proj = AudioProjModel()
+        elif multitalk_model is not None:
             multitalk_model_type = multitalk_model.get("model_type", "MultiTalk")
             log.info(f"{multitalk_model_type} detected, patching model...")
 
@@ -1454,15 +1578,7 @@ class WanVideoModelLoader:
             for block in transformer.blocks:
                 with init_empty_weights():
                     block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
-                    block.audio_cross_attn = SingleStreamMultiAttention(
-                            dim=dim,
-                            encoder_hidden_states_dim=768,
-                            num_heads=num_heads,
-                        qkv_bias=True,
-                        class_range=24,
-                        class_interval=4,
-                        attention_mode=attention_mode,
-                    )
+                    block.audio_cross_attn = SingleStreamMultiAttention(dim=dim, num_heads=num_heads, attention_mode=attention_mode)
             transformer.multitalk_audio_proj = multitalk_model["proj_model"]
             transformer.multitalk_model_type = multitalk_model_type
 
@@ -1480,39 +1596,6 @@ class WanVideoModelLoader:
 
             sd.update(extra_sd)
             del extra_sd
-        elif "multitalk_audio_proj.proj1.weight" in sd:
-            log.info("MultiTalk/InfiniteTalk model detected, patching model...")
-            from .multitalk.multitalk import AudioProjModel
-            from .wanvideo.modules.model import WanLayerNorm
-            from .LongCat.layers import SingleStreamAttention
-
-            audio_window = 5
-            vae_scale = 4
-
-            for block in transformer.blocks:
-                with init_empty_weights():
-                    if "blocks.0.audio_modulation.1.weight" in sd:
-                        block.audio_modulation = nn.Sequential(nn.SiLU(), nn.Linear(512, 3 * dim, bias=True))
-                    block.norm_x = WanLayerNorm(dim, transformer.eps, elementwise_affine=True)
-                    block.audio_cross_attn = SingleStreamAttention(
-                            dim=dim,
-                            encoder_hidden_states_dim=768,
-                            num_heads=num_heads,
-                        qkv_bias=True,
-                        qk_norm=True,
-                        class_range=24,
-                        class_interval=4,
-                        attention_mode=attention_mode,
-                    )
-                    multitalk_proj_model = AudioProjModel(
-                            seq_len=audio_window,
-                            seq_len_vf=audio_window+vae_scale-1,
-                            intermediate_dim=512,
-                            output_dim=768,
-                            context_tokens=32,
-                            norm_output_audio=True,
-                    )
-            transformer.multitalk_audio_proj = multitalk_proj_model
 
         sd = {k.replace(".weight_scale", ".scale_weight"): v for k, v in sd.items()}
 
@@ -1538,11 +1621,7 @@ class WanVideoModelLoader:
             transformer.text_projection = nn.Sequential(nn.Linear(sd["text_projection.0.weight"].shape[1], text_dim), nn.GELU(approximate='tanh'), nn.Linear(text_dim, text_dim))
 
         latent_format=Wan22 if dim == 3072 else Wan21
-        comfy_model = WanVideoModel(
-            WanVideoModelConfig(base_dtype, latent_format=latent_format),
-            model_type=comfy.model_base.ModelType.FLOW,
-            device=device,
-        )
+        comfy_model = WanVideoModel(WanVideoModelConfig(latent_format=latent_format), device=device, transformer=transformer)
 
         # SteadyDancer
         if "condition_embedding_align.cross_attn.in_proj_bias" in sd:
@@ -1605,6 +1684,24 @@ class WanVideoModelLoader:
                     block.ref_attn_k_img = nn.Linear(in_features, out_features)
                     block.ref_attn_v_img = nn.Linear(in_features, out_features)
                     block.ref_attn_norm_k_img = WanRMSNorm(out_features, eps=1e-6)
+
+        if "blocks.0.control_blocks_dense.cross_attn.k.weight" in sd:
+            log.info("LongVie2 model detected, patching model...")
+            from .LongVie2.modules import WanModelDualControl
+            control_layers = 12
+            with init_empty_weights():
+                dual_controller = WanModelDualControl(dim=5120, ffn_dim=13824, eps=1e-06, num_heads=40, control_layers=control_layers)
+                for b in range(control_layers):
+                    transformer.blocks[b].control_blocks_dense = dual_controller.control_blocks_dense[b]
+                    transformer.blocks[b].control_blocks_sparse = dual_controller.control_blocks_sparse[b]
+                    transformer.blocks[b].control_combine_linears = dual_controller.control_combine_linears[b]
+                transformer.dual_controller = nn.Module()
+                transformer.dual_controller.control_initial_combine_linear_dense = dual_controller.control_initial_combine_linear_dense
+                transformer.dual_controller.control_initial_combine_linear_sparse = dual_controller.control_initial_combine_linear_sparse
+                transformer.dual_controller.control_t_mod = dual_controller.control_t_mod
+                transformer.dual_controller.control_text_linear = dual_controller.control_text_linear
+                transformer.dual_controller_freqs = dual_controller.freqs
+
 
         comfy_model.diffusion_model = transformer
         comfy_model.load_device = transformer_load_device
@@ -1710,10 +1807,14 @@ class WanVideoModelLoader:
             )
 
         if merge_loras and lora is not None:
-            log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
-            patcher.model.diffusion_model.to(offload_device)
-            gc.collect()
-            mm.soft_empty_cache()
+            # Skip offloading if load_device is main_device (for unified memory systems like AMD Strix Halo)
+            if load_device != "main_device":
+                log.info(f"Moving diffusion model from {patcher.model.diffusion_model.device} to {offload_device}")
+                patcher.model.diffusion_model.to(offload_device)
+                gc.collect()
+                mm.soft_empty_cache()
+            else:
+                log.info(f"Skipping offload (load_device=main_device, keeping model on {patcher.model.diffusion_model.device})")
 
         patcher.model["base_dtype"] = base_dtype
         patcher.model["weight_dtype"] = weight_dtype
@@ -1786,6 +1887,7 @@ class WanVideoVAELoader:
                 ),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "use_cpu_cache": ("BOOLEAN", {"default": False, "tooltip": "Reduces VRAM usage, but slows the VAE down a lot"}),
+                "verbose": ("BOOLEAN", {"default": False, "tooltip": "Enables memory usage logging when using the model"}),
             }
         }
 
@@ -1795,7 +1897,7 @@ class WanVideoVAELoader:
     CATEGORY = "WanVideoWrapper"
     DESCRIPTION = "Loads Wan VAE model from 'ComfyUI/models/vae'"
 
-    def loadmodel(self, model_name, precision, compile_args=None, use_cpu_cache=False):
+    def loadmodel(self, model_name, precision, compile_args=None, use_cpu_cache=False, verbose=False):
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
         model_path = folder_paths.get_full_path_or_raise("vae", model_name)
         vae_sd = load_torch_file(model_path, safe_load=True)
@@ -1812,9 +1914,9 @@ class WanVideoVAELoader:
             pruning_rate = 0.0
 
         if vae_sd["model.conv2.weight"].shape[0] == 16:
-            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache)
+            vae = WanVideoVAE(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache, verbose=verbose)
         elif vae_sd["model.conv2.weight"].shape[0] == 48:
-            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache)
+            vae = WanVideoVAE38(dtype=dtype, pruning_rate=pruning_rate, cpu_cache=use_cpu_cache, verbose=verbose)
 
         vae.load_state_dict(vae_sd)
         del vae_sd
@@ -2026,6 +2128,8 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoTorchCompileSettings": WanVideoTorchCompileSettings,
     "LoadWanVideoT5TextEncoder": LoadWanVideoT5TextEncoder,
     "LoadWanVideoClipTextEncoder": LoadWanVideoClipTextEncoder,
+    "WanVideoSetAttentionModeOverride": WanVideoSetAttentionModeOverride,
+    "WanVideoUltraVicoSettings": WanVideoUltraVicoSettings,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2044,4 +2148,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoTorchCompileSettings": "WanVideo Torch Compile Settings",
     "LoadWanVideoT5TextEncoder": "WanVideo T5 Text Encoder Loader",
     "LoadWanVideoClipTextEncoder": "WanVideo CLIP Text Encoder Loader",
+    "WanVideoSetAttentionModeOverride": "WanVideo Set Attention Mode Override",
+    "WanVideoUltraVicoSettings": "WanVideo UltraVico Settings"
     }
